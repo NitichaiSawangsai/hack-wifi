@@ -10,7 +10,7 @@ $ nmcli -t -f GENERAL.STATE device show wlan0 | grep -q '100 (connected)' && ech
 
 Run
 ```
-$ python3 wifi-audit.py
+$ python3 wifi-audit.py OR $ sudo python3 wifi-audit.py
 ```
 
 ไฟล์ที่ต้องมีได้แก่

